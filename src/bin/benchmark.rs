@@ -3,11 +3,11 @@ use candle_core::{Device, Tensor, DType};
 use candle_nn::VarBuilder;
 use candle_transformers::generation::LogitsProcessor;
 use clap::Parser;
-use hf_hub;
+// use hf_hub;
 use indicatif::{ProgressBar, ProgressStyle};
 use std::time::Instant;
-use candle_core::IndexOp;
-use tokenizers::Tokenizer;
+// use candle_core::IndexOp;
+// use tokenizers::Tokenizer;
 
 // Import from parent crate library
 use candle_moe_rust::{qwen3_moe, qwen3_moe_optimized};
@@ -284,7 +284,14 @@ fn main() -> Result<()> {
     let start = Instant::now();
     for _ in 0..args.gen_len {
         let logits = model.forward(&last_token, offset)?;
-        let next = logits_processor.sample(&logits.squeeze(0)?)?;
+        // logits shape: [batch_size, seq_len, vocab_size] or [batch_size, vocab_size]
+        let logits_2d = if logits.dims().len() == 3 {
+            logits.squeeze(1)? // Remove seq_len dim if present
+        } else {
+            logits.clone()
+        };
+        let logits_1d = logits_2d.squeeze(0)?; // Remove batch dim -> [vocab_size]
+        let next = logits_processor.sample(&logits_1d)?;
         last_token = Tensor::new(&[next], &device)?.unsqueeze(0)?;
         offset += 1;
         pb.inc(1);

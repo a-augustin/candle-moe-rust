@@ -1,13 +1,11 @@
 [package]
 name = "candle-moe-rust"
 version = "0.1.0"
-edition = "2024"
-
-[lib]
-name = "candle_moe_rust"
-path = "src/mod.rs"
+edition = "2021"
+build = "build.rs"
 
 [features]
+default = ["cuda"]
 cuda = ["candle-core/cuda"]
 
 [dependencies]
@@ -21,3 +19,4 @@ anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
 indicatif = "0.17"
 tokenizers = "0.20"
+half = { version = "2.3", features = ["std"] }
