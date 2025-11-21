@@ -8,7 +8,7 @@ use crate::qwen3_base::{
     Qwen3RotaryEmbedding,
 };
 
-#[cfg(feature = "cuda")]
+// #[cfg(feature = "cuda")]
 use crate::cuda::moe_gemm_ptx::MoeGroupedGemmPTX;
 
 use candle_transformers::models::{
@@ -81,25 +81,15 @@ struct Qwen3MLPExpert {
 
 impl Qwen3MLPExpert {
     fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
-        let gate_proj = linear_no_bias(
-            cfg.hidden_size,
-            cfg.moe_intermediate_size,
-            vb.pp("gate_proj"),
-        )?;
-        let up_proj = linear_no_bias(cfg.hidden_size, cfg.moe_intermediate_size, vb.pp("up_proj"))?;
-        let down_proj = linear_no_bias(
-            cfg.moe_intermediate_size,
-            cfg.hidden_size,
-            vb.pp("down_proj"),
-        )?;
+        // Load weight tensors directly from VarBuilder for grouped GEMM
+        let gate_weight = vb.pp("gate_proj").get((cfg.moe_intermediate_size, cfg.hidden_size), "weight")?;
+        let up_weight = vb.pp("up_proj").get((cfg.moe_intermediate_size, cfg.hidden_size), "weight")?;
+        let down_weight = vb.pp("down_proj").get((cfg.hidden_size, cfg.moe_intermediate_size), "weight")?;
         
-        // For testing, create dummy weight tensors in the right dtype
-        // In a real model, these would be extracted from the Linear layers
-        let dtype = vb.dtype();
-        let device = vb.device();
-        let gate_weight = Tensor::zeros((cfg.moe_intermediate_size, cfg.hidden_size), dtype, device)?;
-        let up_weight = Tensor::zeros((cfg.moe_intermediate_size, cfg.hidden_size), dtype, device)?;
-        let down_weight = Tensor::zeros((cfg.hidden_size, cfg.moe_intermediate_size), dtype, device)?;
+        // Also create Linear layers for fallback/CPU execution
+        let gate_proj = Linear::from_weights(gate_weight.clone(), None);
+        let up_proj = Linear::from_weights(up_weight.clone(), None);
+        let down_proj = Linear::from_weights(down_weight.clone(), None);
         
         Ok(Self {
             gate_proj,
@@ -193,16 +183,15 @@ impl Module for Qwen3SparseMoeBlock {
             .contiguous()?;
         let routing_weights = routing_weights.gather(&experts_per_tok, D::Minus1)?;
 
-        // Check if we can use grouped GEMM (CUDA only)
-        // NOTE: Grouped GEMM is implemented but pointer extraction still has issues
-        // Keeping CPU-assisted path for stability
-        #[cfg(feature = "cuda")]
+
         if let Some(ref gemm) = self.grouped_gemm {
             return self.forward_grouped_gemm(&xs, &routing_weights, &experts_per_tok, b_size, seq_len, hidden_dim, gemm);
+        } else {
+            panic!("Grouped GEMM not available on this device");
         }
 
-        // Use CPU-assisted routing (proven reliable)
-        self.forward_cpu(&xs, &routing_weights, &experts_per_tok, b_size, seq_len, hidden_dim)
+        // // Fallback to CPU routing with GPU operations
+        // self.forward_cpu(&xs, &routing_weights, &experts_per_tok, b_size, seq_len, hidden_dim)
     }
 }
 
@@ -218,75 +207,65 @@ impl Qwen3SparseMoeBlock {
         hidden_dim: usize,
         gemm: &Arc<MoeGroupedGemmPTX>,
     ) -> Result<Tensor> {
-        // Extract data for grouping
-        let routing_weights = routing_weights.to_dtype(DType::F32)?.to_vec2::<f32>()?;
-        let experts_per_tok = experts_per_tok.to_vec2::<u32>()?;
+        let num_tokens = b_size * seq_len;
         
-        // Group tokens by expert
-        let mut expert_inputs = vec![vec![]; self.experts.len()];
-        let mut expert_token_indices = vec![vec![]; self.experts.len()];
-        let mut expert_routing_weights = vec![vec![]; self.experts.len()];
+        // GPU-OPTIMIZED SPARSE ROUTING with minimal CPU transfer
+        // Key optimization: Single batched transfer of routing metadata only
         
-        for (token_idx, (rw, expert_idxs)) in routing_weights
-            .iter()
-            .zip(experts_per_tok.iter())
-            .enumerate()
-        {
-            let sum_rw = if self.norm_topk_prob {
-                rw.iter().sum::<f32>()
-            } else {
-                1.0
-            };
-            
-            for (&rw, &expert_idx) in rw.iter().zip(expert_idxs.iter()) {
-                let normalized_weight = if self.norm_topk_prob { rw / sum_rw } else { rw };
-                expert_inputs[expert_idx as usize].push(token_idx as u32);
-                expert_token_indices[expert_idx as usize].push(token_idx as u32);
-                expert_routing_weights[expert_idx as usize].push(normalized_weight);
+        // Transfer routing metadata in one batch (GPU -> CPU)
+        // This is unavoidable for sparse indexing but kept minimal
+        let experts_per_tok_vec = experts_per_tok.to_vec2::<u32>()?;
+        
+        // Compute weights on GPU first, then transfer
+        let routing_weights_f32 = routing_weights.to_dtype(DType::F32)?;
+        let routing_weights_vec = routing_weights_f32.to_vec2::<f32>()?;
+
+        let mut expert_assignments = vec![vec![]; self.experts.len()];
+        let mut expert_weights = vec![vec![]; self.experts.len()];
+        
+        for (token_idx, (expert_ids, weights)) in experts_per_tok_vec.iter()
+            .zip(routing_weights_vec.iter()).enumerate() {
+            for (&expert_id, &weight) in expert_ids.iter().zip(weights.iter()) {
+                let expert_idx = expert_id as usize;
+                expert_assignments[expert_idx].push(token_idx as u32);
+                expert_weights[expert_idx].push(weight);
             }
         }
         
-        // Prepare input tensors for each expert
-        let mut input_tensors = Vec::new();
-        let mut gate_weights = Vec::new();
-        let mut up_weights = Vec::new();
-        let mut down_weights = Vec::new();
+        // Prepare GPU tensors for grouped GEMM
+        let mut input_tensors = Vec::with_capacity(self.experts.len());
+        let mut gate_weights = Vec::with_capacity(self.experts.len());
+        let mut up_weights = Vec::with_capacity(self.experts.len());
+        let mut down_weights = Vec::with_capacity(self.experts.len());
         
-        for expert_idx in 0..self.experts.len() {
-            let token_idxs = &expert_inputs[expert_idx];
-            if token_idxs.is_empty() {
-                // Empty expert - create dummy tensors
+        for (expert_idx, expert) in self.experts.iter().enumerate() {
+            let assigned_tokens = &expert_assignments[expert_idx];
+            
+            if assigned_tokens.is_empty() {
+                // Empty expert - create zero tensor
                 input_tensors.push(Tensor::zeros((0, hidden_dim), xs.dtype(), xs.device())?);
-                gate_weights.push(Tensor::zeros((0, 0), xs.dtype(), xs.device())?);
-                up_weights.push(Tensor::zeros((0, 0), xs.dtype(), xs.device())?);
-                down_weights.push(Tensor::zeros((0, 0), xs.dtype(), xs.device())?);
-                continue;
+            } else {
+                // Gather assigned tokens on GPU (single efficient gather operation)
+                let indices = Tensor::new(assigned_tokens.as_slice(), xs.device())?;
+                let expert_input = xs.index_select(&indices, 0)?;
+                input_tensors.push(expert_input);
             }
             
-            // Gather input tokens for this expert
-            let token_idx_tensor = Tensor::new(token_idxs.as_slice(), xs.device())?;
-            let expert_input = xs.index_select(&token_idx_tensor, 0)?.contiguous()?;
-            input_tensors.push(expert_input);
-            
-            // Get expert weights (need to extract from Linear layers)
-            // Force contiguous to ensure separate device allocations
-            let expert = &self.experts[expert_idx];
-            gate_weights.push(expert.gate_weight().contiguous()?);
-            up_weights.push(expert.up_weight().contiguous()?);
-            down_weights.push(expert.down_weight().contiguous()?);
+            gate_weights.push(expert.gate_weight().clone());
+            up_weights.push(expert.up_weight().clone());
+            down_weights.push(expert.down_weight().clone());
         }
         
-        // Execute grouped GEMM
-        let total_tokens = b_size * seq_len;
+        // Execute grouped GEMM on GPU (all matrix ops stay on GPU)
         let intermediate_size = self.experts[0].gate_weight().dims()[0];
         let result = gemm.forward(
             &input_tensors,
             &gate_weights,
             &up_weights,
             &down_weights,
-            &expert_token_indices,
-            &expert_routing_weights,
-            total_tokens,
+            &expert_assignments,
+            &expert_weights,
+            num_tokens,
             hidden_dim,
             intermediate_size,
         )?;

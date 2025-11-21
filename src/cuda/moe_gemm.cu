@@ -1,500 +1,457 @@
 #include <cuda_runtime.h>
-#include <cublas_v2.h>
 #include <cuda_fp16.h>
+#include <cublas_v2.h>
 #include <stdint.h>
 #include <stdio.h>
 
+#define CUDA_CHECK(call) \
+    do { \
+        cudaError_t err = call; \
+        if (err != cudaSuccess) { \
+            printf("CUDA error at %s:%d - %s\n", __FILE__, __LINE__, cudaGetErrorString(err)); \
+            return 1; \
+        } \
+    } while(0)
+
+#define CUBLAS_CHECK(call) \
+    do { \
+        cublasStatus_t status = call; \
+        if (status != CUBLAS_STATUS_SUCCESS) { \
+            printf("cuBLAS error at %s:%d - status %d\n", __FILE__, __LINE__, status); \
+            return 1; \
+        } \
+    } while(0)
+
+#define MAX_EXPERTS 64
+#define WARP_SIZE 32
+#define MAX_THREADS_PER_BLOCK 1024
+#define TILE_M 128
+#define TILE_N 128
+#define TILE_K 16
+
+__device__ __forceinline__ float silu_activation(float x) {
+    return x / (1.0f + expf(-x));
+}
+
+__device__ __forceinline__ half silu_activation(half x) {
+    float fx = __half2float(x);
+    return __float2half(fx / (1.0f + expf(-fx)));
+}
+
+template<typename T>
+__global__ void fused_silu_mul_kernel(
+    const T* __restrict__ gate,
+    const T* __restrict__ up,
+    T* __restrict__ output,
+    int total_elements
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    for (int i = idx; i < total_elements; i += blockDim.x * gridDim.x) {
+        T g = gate[i];
+        T u = up[i];
+        output[i] = silu_activation(g) * u;
+    }
+}
+
+__global__ void fused_silu_mul_kernel_vec4(
+    const float4* __restrict__ gate,
+    const float4* __restrict__ up,
+    float4* __restrict__ output,
+    int vec4_elements
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    for (int i = idx; i < vec4_elements; i += blockDim.x * gridDim.x) {
+        float4 g = gate[i];
+        float4 u = up[i];
+        float4 o;
+        
+        o.x = silu_activation(g.x) * u.x;
+        o.y = silu_activation(g.y) * u.y;
+        o.z = silu_activation(g.z) * u.z;
+        o.w = silu_activation(g.w) * u.w;
+        
+        output[i] = o;
+    }
+}
+
+template<typename T>
+__global__ void weighted_scatter_reduce_kernel(
+    const T* __restrict__ expert_output,
+    const int* __restrict__ token_indices,
+    const float* __restrict__ routing_weights,
+    T* __restrict__ final_output,
+    int num_tokens_expert,
+    int hidden_size
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_elements = num_tokens_expert * hidden_size;
+    
+    if (idx < total_elements) {
+        int local_token_idx = idx / hidden_size;
+        int feature_idx = idx % hidden_size;
+        
+        int global_token_idx = token_indices[local_token_idx];
+        float weight = routing_weights[local_token_idx];
+        int output_idx = global_token_idx * hidden_size + feature_idx;
+        
+        if constexpr (sizeof(T) == 4) {
+            atomicAdd(&final_output[output_idx], static_cast<T>(expert_output[idx] * weight));
+        } else {
+            float val = __half2float(expert_output[idx]) * weight;
+            atomicAdd((float*)&final_output[output_idx], val);
+        }
+    }
+}
+
+__global__ void weighted_scatter_reduce_fp32(
+    const float* __restrict__ expert_output,
+    const int* __restrict__ token_indices,
+    const float* __restrict__ routing_weights,
+    float* __restrict__ final_output,
+    int num_tokens_expert,
+    int hidden_size
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * gridDim.x;
+    int total_elements = num_tokens_expert * hidden_size;
+    
+    for (int i = idx; i < total_elements; i += stride) {
+        int local_token_idx = i / hidden_size;
+        int feature_idx = i % hidden_size;
+        
+        int global_token_idx = token_indices[local_token_idx];
+        float weight = routing_weights[local_token_idx];
+        int output_idx = global_token_idx * hidden_size + feature_idx;
+        
+        float value = expert_output[i] * weight;
+        atomicAdd(&final_output[output_idx], value);
+    }
+}
+
+struct GemmProblem {
+    int m;
+    int n;
+    int k;
+    const void* A;
+    const void* B;
+    void* C;
+    int lda;
+    int ldb;
+    int ldc;
+    int expert_id;
+};
+
 extern "C" {
 
-// Structure to hold grouped GEMM parameters for MoE
-typedef struct {
-    int num_experts;
-    int num_tokens_per_expert;
-    int hidden_size;
-    int intermediate_size;
-    const void** expert_weights;  // Array of expert weight pointers
-    const void** input_tokens;     // Array of input token pointers per expert
-    void** outputs;                // Array of output pointers per expert
-    const float* routing_weights;  // Routing weights for each token-expert pair
-    cudaDataType_t data_type;
-} MoeGemmParams;
-
-/**
- * Grouped GEMM kernel for MoE expert computation
- * Uses cuBLAS batched GEMM operations to efficiently compute multiple experts in parallel
- * 
- * Each expert processes its assigned tokens:
- * output[expert_i] = gate(input[expert_i] @ gate_proj[expert_i]) * (input[expert_i] @ up_proj[expert_i])
- * final_output[expert_i] = output[expert_i] @ down_proj[expert_i]
- */
-cudaError_t moe_grouped_gemm_gate_up(
-    cublasHandle_t handle,
-    int num_groups,
-    const int* tokens_per_group,      // Number of tokens for each expert
-    const void** input_ptrs,          // Input tensors [tokens, hidden_size] for each expert
-    const void** gate_weight_ptrs,    // Gate projection weights [intermediate, hidden] for each expert
-    const void** up_weight_ptrs,      // Up projection weights [intermediate, hidden] for each expert
-    void** gate_outputs,              // Gate outputs [tokens, intermediate] for each expert
-    void** up_outputs,                // Up outputs [tokens, intermediate] for each expert
-    int hidden_size,
-    int intermediate_size,
-    cudaDataType_t compute_type,
-    bool use_fp16
-) {
-    cublasStatus_t status;
-    
-    // Create cuBLAS handle if not provided
-    cublasHandle_t local_handle = handle;
-    bool created_handle = false;
-    if (local_handle == nullptr) {
-        status = cublasCreate(&local_handle);
-        if (status != CUBLAS_STATUS_SUCCESS) {
-            printf("Failed to create cuBLAS handle: %d\n", status);
-            return cudaErrorInitializationError;
-        }
-        created_handle = true;
-    }
-    
-    printf("CUDA moe_grouped_gemm_gate_up called:\n");
-    printf("  num_groups=%d, hidden_size=%d, intermediate_size=%d, use_fp16=%d\n", 
-           num_groups, hidden_size, intermediate_size, use_fp16);
-    
-    // cuBLAS uses column-major, so we need to transpose our operations
-    // For C = A @ B^T (row-major), we compute C^T = B @ A^T (col-major)
-    cublasOperation_t trans = CUBLAS_OP_N;
-    cublasOperation_t no_trans = CUBLAS_OP_N;
-    
-    float alpha = 1.0f;
-    float beta = 0.0f;
-    half alpha_fp16 = __float2half(1.0f);
-    half beta_fp16 = __float2half(0.0f);
-    
-    // Process each expert group
-    for (int i = 0; i < num_groups; i++) {
-        int m = tokens_per_group[i];
-        if (m == 0) continue;
-        
-        int k = hidden_size;
-        int n = intermediate_size;
-        
-        if (use_fp16) {
-            // Gate projection: gate_output = input @ gate_weights^T
-            // Shape: [m, k] @ [n, k]^T = [m, n]
-            status = cublasGemmEx(
-                local_handle,
-                CUBLAS_OP_N,  // gate_weights: no transpose (stored transposed)
-                CUBLAS_OP_N,  // input: no transpose
-                n, m, k,      // n, m, k in column-major
-                &alpha_fp16,
-                gate_weight_ptrs[i], CUDA_R_16F, n,
-                input_ptrs[i], CUDA_R_16F, k,
-                &beta_fp16,
-                gate_outputs[i], CUDA_R_16F, n,
-                compute_type,
-                CUBLAS_GEMM_DEFAULT_TENSOR_OP
-            );
-            if (status != CUBLAS_STATUS_SUCCESS) {
-                printf("Gate GEMM failed for expert %d: %d\n", i, status);
-                if (created_handle) cublasDestroy(local_handle);
-                return cudaErrorUnknown;
-            }
-            
-            // Up projection: up_output = input @ up_weights^T
-            status = cublasGemmEx(
-                local_handle,
-                CUBLAS_OP_N,
-                CUBLAS_OP_N,
-                n, m, k,
-                &alpha_fp16,
-                up_weight_ptrs[i], CUDA_R_16F, n,
-                input_ptrs[i], CUDA_R_16F, k,
-                &beta_fp16,
-                up_outputs[i], CUDA_R_16F, n,
-                compute_type,
-                CUBLAS_GEMM_DEFAULT_TENSOR_OP
-            );
-            if (status != CUBLAS_STATUS_SUCCESS) {
-                printf("Up GEMM failed for expert %d: %d\n", i, status);
-                if (created_handle) cublasDestroy(local_handle);
-                return cudaErrorUnknown;
-            }
-        } else {
-            // FP32 version
-            status = cublasSgemm(
-                local_handle,
-                CUBLAS_OP_N,
-                CUBLAS_OP_N,
-                n, m, k,
-                &alpha,
-                (const float*)gate_weight_ptrs[i], n,
-                (const float*)input_ptrs[i], k,
-                &beta,
-                (float*)gate_outputs[i], n
-            );
-            if (status != CUBLAS_STATUS_SUCCESS) {
-                if (created_handle) cublasDestroy(local_handle);
-                return cudaErrorUnknown;
-            }
-            
-            status = cublasSgemm(
-                local_handle,
-                CUBLAS_OP_N,
-                CUBLAS_OP_N,
-                n, m, k,
-                &alpha,
-                (const float*)up_weight_ptrs[i], n,
-                (const float*)input_ptrs[i], k,
-                &beta,
-                (float*)up_outputs[i], n
-            );
-            if (status != CUBLAS_STATUS_SUCCESS) {
-                if (created_handle) cublasDestroy(local_handle);
-                return cudaErrorUnknown;
-            }
-        }
-    }
-    
-    if (created_handle) {
-        cublasDestroy(local_handle);
-    }
-    
-    return cudaSuccess;
-}
-
-/**
- * SiLU activation and element-wise multiplication kernel
- * output = silu(gate) * up
- */
-// SiLU + Mul kernel with column-major input layout from cuBLAS GEMM
-// gate and up are column-major: [intermediate_size, num_tokens]
-// We need to read them correctly and write row-major output: [num_tokens, intermediate_size]
-__global__ void silu_mul_kernel_fp16(
-    const half* gate,          // Column-major: [intermediate_size, num_tokens]
-    const half* up,            // Column-major: [intermediate_size, num_tokens]
-    half* output,              // Row-major: [num_tokens, intermediate_size]
+int launch_fused_silu_mul_fp32(
+    const float* gate,
+    const float* up,
+    float* output,
     int num_tokens,
-    int intermediate_size
+    int intermediate_size,
+    cudaStream_t stream
 ) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total_elements = num_tokens * intermediate_size;
     
-    if (idx < total_elements) {
-        // Convert linear index to row-major coordinates
-        int token_idx = idx / intermediate_size;
-        int feat_idx = idx % intermediate_size;
+    if (intermediate_size % 4 == 0) {
+        int vec4_elements = total_elements / 4;
+        int threads = 256;
+        int blocks = (vec4_elements + threads - 1) / threads;
         
-        // Read from column-major layout: gate[feat, token] = gate[feat * num_tokens + token]
-        int col_major_idx = feat_idx * num_tokens + token_idx;
-        
-        float g = __half2float(gate[col_major_idx]);
-        float u = __half2float(up[col_major_idx]);
-        float silu = g / (1.0f + expf(-g));
-        
-        // Write to row-major layout: output[token, feat] = output[token * intermediate_size + feat]
-        output[idx] = __float2half(silu * u);
-    }
-}
-
-__global__ void silu_mul_kernel_fp32(
-    const float* gate,         // Column-major: [intermediate_size, num_tokens]
-    const float* up,           // Column-major: [intermediate_size, num_tokens]
-    float* output,             // Row-major: [num_tokens, intermediate_size]
-    int num_tokens,
-    int intermediate_size
-) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total_elements = num_tokens * intermediate_size;
-    
-    if (idx < total_elements) {
-        // Convert linear index to row-major coordinates
-        int token_idx = idx / intermediate_size;
-        int feat_idx = idx % intermediate_size;
-        
-        // Read from column-major layout
-        int col_major_idx = feat_idx * num_tokens + token_idx;
-        
-        float g = gate[col_major_idx];
-        float u = up[col_major_idx];
-        float silu = g / (1.0f + expf(-g));
-        
-        // Write to row-major layout
-        output[idx] = silu * u;
-    }
-}
-
-cudaError_t moe_silu_mul(
-    void** gate_outputs,
-    void** up_outputs,
-    void** merged_outputs,
-    const int* tokens_per_group,
-    int num_groups,
-    int intermediate_size,
-    bool use_fp16
-) {
-    if (!gate_outputs || !up_outputs || !merged_outputs || !tokens_per_group) {
-        return cudaErrorInvalidValue;
-    }
-    
-    // Debug: print pointers received
-    printf("CUDA kernel moe_silu_mul called:\n");
-    printf("  num_groups=%d, intermediate_size=%d, use_fp16=%d\n", num_groups, intermediate_size, use_fp16);
-    for (int i = 0; i < num_groups; i++) {
-        printf("  Group %d: tokens_per_group=%d, gate=0x%llx, up=0x%llx, merged=0x%llx\n", 
-               i, tokens_per_group[i], 
-               (unsigned long long)gate_outputs[i],
-               (unsigned long long)up_outputs[i],
-               (unsigned long long)merged_outputs[i]);
-    }
-    
-    int threads = 256;
-    
-    for (int i = 0; i < num_groups; i++) {
-        int num_tokens = tokens_per_group[i];
-        if (num_tokens == 0) continue;
-        
-        // Safety check - ensure pointers are not null
-        if (!gate_outputs[i] || !up_outputs[i] || !merged_outputs[i]) {
-            printf("Warning: Skipping expert %d due to null pointer\n", i);
-            continue;
-        }
-        
-        int total_elements = num_tokens * intermediate_size;
+        fused_silu_mul_kernel_vec4<<<blocks, threads, 0, stream>>>(
+            reinterpret_cast<const float4*>(gate),
+            reinterpret_cast<const float4*>(up),
+            reinterpret_cast<float4*>(output),
+            vec4_elements
+        );
+    } else {
+        int threads = 256;
         int blocks = (total_elements + threads - 1) / threads;
-        printf("Launching kernel for group %d: blocks=%d, threads=%d, tokens=%d, features=%d\n", 
-               i, blocks, threads, num_tokens, intermediate_size);
         
-        if (use_fp16) {
-            silu_mul_kernel_fp16<<<blocks, threads>>>(
-                (const half*)gate_outputs[i],
-                (const half*)up_outputs[i],
-                (half*)merged_outputs[i],
-                num_tokens,
-                intermediate_size
-            );
-        } else {
-            silu_mul_kernel_fp32<<<blocks, threads>>>(
-                (const float*)gate_outputs[i],
-                (const float*)up_outputs[i],
-                (float*)merged_outputs[i],
-                num_tokens,
-                intermediate_size
-            );
-        }
-        
-        // Check for kernel launch errors
-        cudaError_t err = cudaGetLastError();
-        if (err != cudaSuccess) {
-            printf("Kernel launch error for group %d: %s\n", i, cudaGetErrorString(err));
-            return err;
-        }
-        
-        // Synchronize to catch runtime errors
-        err = cudaDeviceSynchronize();
-        if (err != cudaSuccess) {
-            printf("Kernel execution error for group %d: %s\n", i, cudaGetErrorString(err));
-            return err;
-        }
+        fused_silu_mul_kernel<float><<<blocks, threads, 0, stream>>>(
+            gate, up, output, total_elements
+        );
     }
     
-    return cudaSuccess;
+    CUDA_CHECK(cudaGetLastError());
+    return 0;
 }
 
-/**
- * Down projection: final_output = merged @ down_weights^T
- * Input: merged is ROW-MAJOR [tokens, intermediate] from SiLU kernel
- * Weights: down_weights is stored as [hidden, intermediate] (transposed)
- * Output: ROW-MAJOR [tokens, hidden]
- */
-cudaError_t moe_grouped_gemm_down(
-    cublasHandle_t handle,
-    int num_groups,
-    const int* tokens_per_group,
-    const void** merged_ptrs,         // ROW-MAJOR: [tokens, intermediate]
-    const void** down_weight_ptrs,    // Weight matrix: [hidden, intermediate]
-    void** outputs,                   // ROW-MAJOR: [tokens, hidden]
+int launch_fused_silu_mul_fp16(
+    const half* gate,
+    const half* up,
+    half* output,
+    int num_tokens,
+    int intermediate_size,
+    cudaStream_t stream
+) {
+    int total_elements = num_tokens * intermediate_size;
+    int threads = 256;
+    int blocks = (total_elements + threads - 1) / threads;
+    
+    fused_silu_mul_kernel<half><<<blocks, threads, 0, stream>>>(
+        gate, up, output, total_elements
+    );
+    
+    CUDA_CHECK(cudaGetLastError());
+    return 0;
+}
+
+int launch_weighted_scatter_fp32(
+    const float* expert_output,
+    const int* token_indices,
+    const float* routing_weights,
+    float* final_output,
+    int num_tokens_expert,
+    int hidden_size,
+    cudaStream_t stream
+) {
+    int total_elements = num_tokens_expert * hidden_size;
+    int threads = 256;
+    int blocks = (total_elements + threads - 1) / threads;
+    
+    weighted_scatter_reduce_fp32<<<blocks, threads, 0, stream>>>(
+        expert_output,
+        token_indices,
+        routing_weights,
+        final_output,
+        num_tokens_expert,
+        hidden_size
+    );
+    
+    CUDA_CHECK(cudaGetLastError());
+    return 0;
+}
+
+int grouped_gemm_moe_forward_fp32(
+    int num_experts,
+    const int* tokens_per_expert,
+    const float* const* input_ptrs,
+    const float* const* gate_weight_ptrs,
+    const float* const* up_weight_ptrs,
+    const float* const* down_weight_ptrs,
+    const int* const* token_indices,
+    const float* const* routing_weights,
+    float* final_output,
+    int total_tokens,
     int hidden_size,
     int intermediate_size,
-    cudaDataType_t compute_type,
-    bool use_fp16
+    cudaStream_t stream
 ) {
-    cublasStatus_t status;
+    cublasHandle_t handle;
+    CUBLAS_CHECK(cublasCreate(&handle));
+    CUBLAS_CHECK(cublasSetStream(handle, stream));
+    CUBLAS_CHECK(cublasSetMathMode(handle, CUBLAS_TENSOR_OP_MATH));
     
-    // Create cuBLAS handle if not provided
-    cublasHandle_t local_handle = handle;
-    bool created_handle = false;
-    if (local_handle == nullptr) {
-        status = cublasCreate(&local_handle);
-        if (status != CUBLAS_STATUS_SUCCESS) {
-            return cudaErrorInitializationError;
-        }
-        created_handle = true;
-    }
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
     
-    float alpha = 1.0f;
-    float beta = 0.0f;
-    half alpha_fp16 = __float2half(1.0f);
-    half beta_fp16 = __float2half(0.0f);
+    CUDA_CHECK(cudaMemsetAsync(final_output, 0, total_tokens * hidden_size * sizeof(float), stream));
     
-    for (int i = 0; i < num_groups; i++) {
-        int m = tokens_per_group[i];
-        if (m == 0) continue;
-        
-        int k = intermediate_size;
-        int n = hidden_size;
-        
-        // Row-major: C[m,n] = A[m,k] @ B[k,n]^T = A[m,k] @ B[n,k]
-        // In cuBLAS column-major: C^T[n,m] = B[n,k] @ A^T[k,m]
-        // Since A is row-major [m,k], A^T in col-major has lda=k
-        // Since B is stored as [n,k], it's already transposed for us
-        
-        if (use_fp16) {
-            status = cublasGemmEx(
-                local_handle,
-                CUBLAS_OP_N,      // down_weights[n,k]: no transpose
-                CUBLAS_OP_T,      // merged[m,k] row-major -> transpose for col-major
-                n, m, k,
-                &alpha_fp16,
-                down_weight_ptrs[i], CUDA_R_16F, n,  // lda = n (leading dim of col-major view)
-                merged_ptrs[i], CUDA_R_16F, k,       // ldb = k (leading dim of row-major as transposed)
-                &beta_fp16,
-                outputs[i], CUDA_R_16F, n,           // ldc = n (output is col-major)
-                compute_type,
-                CUBLAS_GEMM_DEFAULT_TENSOR_OP
-            );
-            if (status != CUBLAS_STATUS_SUCCESS) {
-                printf("Down GEMM failed for expert %d: %d\n", i, status);
-                if (created_handle) cublasDestroy(local_handle);
-                return cudaErrorUnknown;
-            }
-        } else {
-            // FP32 version: same layout handling
-            status = cublasSgemm(
-                local_handle,
-                CUBLAS_OP_N,      // down_weights[n,k]: no transpose
-                CUBLAS_OP_T,      // merged[m,k] row-major -> transpose
-                n, m, k,
-                &alpha,
-                (const float*)down_weight_ptrs[i], n,
-                (const float*)merged_ptrs[i], k,
-                &beta,
-                (float*)outputs[i], n
-            );
-            if (status != CUBLAS_STATUS_SUCCESS) {
-                if (created_handle) cublasDestroy(local_handle);
-                return cudaErrorUnknown;
-            }
-        }
-    }
-    
-    if (created_handle) {
-        cublasDestroy(local_handle);
-    }
-    
-    return cudaSuccess;
-}
-
-/**
- * Apply routing weights and scatter back to original positions
- * expert_output is COLUMN-MAJOR [hidden, num_tokens] from cuBLAS down projection
- * final_output is ROW-MAJOR [total_tokens, hidden]
- * output[token_indices[i]] += expert_output[i] * routing_weights[i]
- */
-__global__ void scatter_weighted_kernel_fp16(
-    const half* expert_output,      // Column-major: [hidden, num_tokens]
-    half* final_output,             // Row-major: [total_tokens, hidden]
-    const int* token_indices,
-    const float* routing_weights,
-    int num_tokens,
-    int hidden_size
-) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total_elements = num_tokens * hidden_size;
-    
-    if (idx < total_elements) {
-        // Output is row-major indexed
-        int token_idx = idx / hidden_size;
-        int hidden_idx = idx % hidden_size;
-        
-        // Read from column-major: expert_output[hidden, token] = expert_output[hidden * num_tokens + token]
-        int col_major_idx = hidden_idx * num_tokens + token_idx;
-        
-        // Write to row-major: final_output[token_indices[token_idx], hidden_idx]
-        int out_idx = token_indices[token_idx] * hidden_size + hidden_idx;
-        
-        float weight = routing_weights[token_idx];
-        float value = __half2float(expert_output[col_major_idx]);
-        atomicAdd((float*)&final_output[out_idx], weight * value);
-    }
-}
-
-__global__ void scatter_weighted_kernel_fp32(
-    const float* expert_output,     // Column-major: [hidden, num_tokens]
-    float* final_output,            // Row-major: [total_tokens, hidden]
-    const int* token_indices,
-    const float* routing_weights,
-    int num_tokens,
-    int hidden_size
-) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total_elements = num_tokens * hidden_size;
-    
-    if (idx < total_elements) {
-        int token_idx = idx / hidden_size;
-        int hidden_idx = idx % hidden_size;
-        
-        // Read from column-major
-        int col_major_idx = hidden_idx * num_tokens + token_idx;
-        
-        // Write to row-major
-        int out_idx = token_indices[token_idx] * hidden_size + hidden_idx;
-        
-        float weight = routing_weights[token_idx];
-        float value = expert_output[col_major_idx];
-        atomicAdd(&final_output[out_idx], weight * value);
-    }
-}
-
-cudaError_t moe_scatter_weighted(
-    void** expert_outputs,
-    void* final_output,
-    const int** token_indices,
-    const float** routing_weights,
-    const int* tokens_per_group,
-    int num_groups,
-    int hidden_size,
-    bool use_fp16
-) {
-    int threads = 256;
-    
-    for (int i = 0; i < num_groups; i++) {
-        int num_tokens = tokens_per_group[i];
+    for (int expert_idx = 0; expert_idx < num_experts; expert_idx++) {
+        int num_tokens = tokens_per_expert[expert_idx];
         if (num_tokens == 0) continue;
         
-        int size = num_tokens * hidden_size;
-        int blocks = (size + threads - 1) / threads;
+        float *gate_out, *up_out, *merged_out, *down_out;
+        CUDA_CHECK(cudaMallocAsync(&gate_out, num_tokens * intermediate_size * sizeof(float), stream));
+        CUDA_CHECK(cudaMallocAsync(&up_out, num_tokens * intermediate_size * sizeof(float), stream));
+        CUDA_CHECK(cudaMallocAsync(&merged_out, num_tokens * intermediate_size * sizeof(float), stream));
+        CUDA_CHECK(cudaMallocAsync(&down_out, num_tokens * hidden_size * sizeof(float), stream));
         
-        if (use_fp16) {
-            scatter_weighted_kernel_fp16<<<blocks, threads>>>(
-                (const half*)expert_outputs[i],
-                (half*)final_output,
-                token_indices[i],
-                routing_weights[i],
-                num_tokens,
-                hidden_size
-            );
-        } else {
-            scatter_weighted_kernel_fp32<<<blocks, threads>>>(
-                (const float*)expert_outputs[i],
-                (float*)final_output,
-                token_indices[i],
-                routing_weights[i],
-                num_tokens,
-                hidden_size
-            );
-        }
+        CUBLAS_CHECK(cublasSgemm(
+            handle,
+            CUBLAS_OP_T, CUBLAS_OP_N,
+            intermediate_size,
+            num_tokens,
+            hidden_size,
+            &alpha,
+            gate_weight_ptrs[expert_idx], hidden_size,
+            input_ptrs[expert_idx],       hidden_size,
+            &beta,
+            gate_out, intermediate_size
+        ));
+        
+        CUBLAS_CHECK(cublasSgemm(
+            handle,
+            CUBLAS_OP_T, CUBLAS_OP_N,
+            intermediate_size, num_tokens, hidden_size,
+            &alpha,
+            up_weight_ptrs[expert_idx], hidden_size,
+            input_ptrs[expert_idx],     hidden_size,
+            &beta,
+            up_out, intermediate_size
+        ));
+        
+        launch_fused_silu_mul_fp32(
+            gate_out, up_out, merged_out,
+            num_tokens, intermediate_size,
+            stream
+        );
+        
+        CUBLAS_CHECK(cublasSgemm(
+            handle,
+            CUBLAS_OP_T, CUBLAS_OP_N,
+            hidden_size,
+            num_tokens,
+            intermediate_size,
+            &alpha,
+            down_weight_ptrs[expert_idx], intermediate_size,
+            merged_out,                   intermediate_size,
+            &beta,
+            down_out, hidden_size
+        ));
+        
+        launch_weighted_scatter_fp32(
+            down_out,
+            token_indices[expert_idx],
+            routing_weights[expert_idx],
+            final_output,
+            num_tokens,
+            hidden_size,
+            stream
+        );
+        
+        CUDA_CHECK(cudaFreeAsync(gate_out, stream));
+        CUDA_CHECK(cudaFreeAsync(up_out, stream));
+        CUDA_CHECK(cudaFreeAsync(merged_out, stream));
+        CUDA_CHECK(cudaFreeAsync(down_out, stream));
     }
     
-    return cudaGetLastError();
+    CUBLAS_CHECK(cublasDestroy(handle));
+    
+    return 0;
 }
 
-} // extern "C"
+int grouped_gemm_moe_forward_fp16(
+    int num_experts,
+    const int* tokens_per_expert,
+    const half* const* input_ptrs,
+    const half* const* gate_weight_ptrs,
+    const half* const* up_weight_ptrs,
+    const half* const* down_weight_ptrs,
+    const int* const* token_indices,
+    const float* const* routing_weights,
+    half* final_output,
+    int total_tokens,
+    int hidden_size,
+    int intermediate_size,
+    cudaStream_t stream
+) {
+    cublasHandle_t handle;
+    CUBLAS_CHECK(cublasCreate(&handle));
+    CUBLAS_CHECK(cublasSetStream(handle, stream));
+    CUBLAS_CHECK(cublasSetMathMode(handle, CUBLAS_TENSOR_OP_MATH));
+    
+    const half alpha = __float2half(1.0f);
+    const half beta = __float2half(0.0f);
+    
+    CUDA_CHECK(cudaMemsetAsync(final_output, 0, total_tokens * hidden_size * sizeof(half), stream));
+    
+    for (int expert_idx = 0; expert_idx < num_experts; expert_idx++) {
+        int num_tokens = tokens_per_expert[expert_idx];
+        if (num_tokens == 0) continue;
+        
+        half *gate_out, *up_out, *merged_out, *down_out;
+        CUDA_CHECK(cudaMallocAsync(&gate_out, num_tokens * intermediate_size * sizeof(half), stream));
+        CUDA_CHECK(cudaMallocAsync(&up_out, num_tokens * intermediate_size * sizeof(half), stream));
+        CUDA_CHECK(cudaMallocAsync(&merged_out, num_tokens * intermediate_size * sizeof(half), stream));
+        CUDA_CHECK(cudaMallocAsync(&down_out, num_tokens * hidden_size * sizeof(half), stream));
+        
+        CUBLAS_CHECK(cublasHgemm(
+            handle,
+            CUBLAS_OP_T, CUBLAS_OP_N,
+            intermediate_size, num_tokens, hidden_size,
+            &alpha,
+            gate_weight_ptrs[expert_idx], hidden_size,
+            input_ptrs[expert_idx],       hidden_size,
+            &beta,
+            gate_out, intermediate_size
+        ));
+        
+        CUBLAS_CHECK(cublasHgemm(
+            handle,
+            CUBLAS_OP_T, CUBLAS_OP_N,
+            intermediate_size, num_tokens, hidden_size,
+            &alpha,
+            up_weight_ptrs[expert_idx], hidden_size,
+            input_ptrs[expert_idx],     hidden_size,
+            &beta,
+            up_out, intermediate_size
+        ));
+        
+        launch_fused_silu_mul_fp16(
+            gate_out, up_out, merged_out,
+            num_tokens, intermediate_size,
+            stream
+        );
+        
+        CUBLAS_CHECK(cublasHgemm(
+            handle,
+            CUBLAS_OP_T, CUBLAS_OP_N,
+            hidden_size, num_tokens, intermediate_size,
+            &alpha,
+            down_weight_ptrs[expert_idx], intermediate_size,
+            merged_out,                   intermediate_size,
+            &beta,
+            down_out, hidden_size
+        ));
+        
+        launch_weighted_scatter_fp32(
+            reinterpret_cast<const float*>(down_out),
+            token_indices[expert_idx],
+            routing_weights[expert_idx],
+            reinterpret_cast<float*>(final_output),
+            num_tokens,
+            hidden_size,
+            stream
+        );
+        
+        CUDA_CHECK(cudaFreeAsync(gate_out, stream));
+        CUDA_CHECK(cudaFreeAsync(up_out, stream));
+        CUDA_CHECK(cudaFreeAsync(merged_out, stream));
+        CUDA_CHECK(cudaFreeAsync(down_out, stream));
+    }
+    
+    CUBLAS_CHECK(cublasDestroy(handle));
+    return 0;
+}
+
+}
+
+extern "C" __global__ void silu_mul_kernel_fp32(
+    const float* gate,
+    const float* up,
+    float* output,
+    int num_tokens,
+    int intermediate_size
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_elements = num_tokens * intermediate_size;
+    
+    for (int i = idx; i < total_elements; i += blockDim.x * gridDim.x) {
+        float g = gate[i];
+        float u = up[i];
+        float sigmoid = 1.0f / (1.0f + expf(-g));
+        output[i] = (sigmoid * g) * u;
+    }
+}
+
+extern "C" __global__ void silu_mul_kernel_fp16(
+    const half* gate,
+    const half* up,
+    half* output,
+    int num_tokens,
+    int intermediate_size
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_elements = num_tokens * intermediate_size;
+    
+    for (int i = idx; i < total_elements; i += blockDim.x * gridDim.x) {
+        float g = __half2float(gate[i]);
+        float u = __half2float(up[i]);
+        float sigmoid = 1.0f / (1.0f + expf(-g));
+        output[i] = __float2half((sigmoid * g) * u);
+    }
+}
