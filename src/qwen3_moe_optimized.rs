@@ -8,9 +8,6 @@ use crate::qwen3_base::{
     Qwen3RotaryEmbedding,
 };
 
-// #[cfg(feature = "cuda")]
-use crate::cuda::moe_gemm_ptx::MoeGroupedGemmPTX;
-
 use candle_transformers::models::{
     with_tracing::{linear_no_bias, Linear, RmsNorm},
 };
@@ -73,45 +70,24 @@ struct Qwen3MLPExpert {
     up_proj: Linear,
     down_proj: Linear,
     act_fn: Activation,
-    // Store weight tensors for grouped GEMM access
-    gate_weight: Tensor,
-    up_weight: Tensor,
-    down_weight: Tensor,
 }
 
 impl Qwen3MLPExpert {
     fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
-        // Load weight tensors directly from VarBuilder for grouped GEMM
-        let gate_weight = vb.pp("gate_proj").get((cfg.moe_intermediate_size, cfg.hidden_size), "weight")?;
-        let up_weight = vb.pp("up_proj").get((cfg.moe_intermediate_size, cfg.hidden_size), "weight")?;
-        let down_weight = vb.pp("down_proj").get((cfg.hidden_size, cfg.moe_intermediate_size), "weight")?;
-        
-        // Also create Linear layers for fallback/CPU execution
-        let gate_proj = Linear::from_weights(gate_weight.clone(), None);
-        let up_proj = Linear::from_weights(up_weight.clone(), None);
-        let down_proj = Linear::from_weights(down_weight.clone(), None);
-        
         Ok(Self {
-            gate_proj,
-            up_proj,
-            down_proj,
+            gate_proj: linear_no_bias(
+                cfg.hidden_size,
+                cfg.moe_intermediate_size,
+                vb.pp("gate_proj"),
+            )?,
+            up_proj: linear_no_bias(cfg.hidden_size, cfg.moe_intermediate_size, vb.pp("up_proj"))?,
+            down_proj: linear_no_bias(
+                cfg.moe_intermediate_size,
+                cfg.hidden_size,
+                vb.pp("down_proj"),
+            )?,
             act_fn: cfg.hidden_act,
-            gate_weight,
-            up_weight,
-            down_weight,
         })
-    }
-    
-    fn gate_weight(&self) -> &Tensor {
-        &self.gate_weight
-    }
-    
-    fn up_weight(&self) -> &Tensor {
-        &self.up_weight
-    }
-    
-    fn down_weight(&self) -> &Tensor {
-        &self.down_weight
     }
 }
 
@@ -130,8 +106,6 @@ struct Qwen3SparseMoeBlock {
     experts: Vec<Qwen3MLPExpert>,
     norm_topk_prob: bool,
     num_experts_per_tok: usize,
-    #[cfg(feature = "cuda")]
-    grouped_gemm: Option<Arc<MoeGroupedGemmPTX>>,
 }
 
 impl Qwen3SparseMoeBlock {
@@ -143,243 +117,113 @@ impl Qwen3SparseMoeBlock {
             let expert = Qwen3MLPExpert::new(cfg, vb_e.pp(idx))?;
             experts.push(expert)
         }
-        
-        #[cfg(feature = "cuda")]
-        let grouped_gemm = if let Device::Cuda(cuda_dev) = vb.device() {
-            let use_fp16 = matches!(vb.dtype(), DType::F16 | DType::BF16);
-            match MoeGroupedGemmPTX::new(cuda_dev, use_fp16) {
-                Ok(gemm) => Some(Arc::new(gemm)),
-                Err(e) => {
-                    eprintln!("Warning: Failed to initialize MoeGroupedGemmPTX: {}", e);
-                    None
-                }
-            }
-        } else {
-            None
-        };
-        
         Ok(Self {
             gate,
             experts,
             norm_topk_prob: cfg.norm_topk_prob,
             num_experts_per_tok: cfg.num_experts_per_tok,
-            #[cfg(feature = "cuda")]
-            grouped_gemm,
+        })
+    }
+}
+
+
+#[allow(dead_code)]
+pub struct TopKOutput {
+    pub values: Tensor,
+    pub indices: Tensor,
+}
+
+// Reference: https://github.com/EricLBuehler/mistral.rs/blob/6aec940499be1cf72c628f7ddaa8b3e59bcb4fda/mistralrs-core/src/ops.rs#L482-L504
+pub trait TopKLastDimOp {
+    /// Topk in the last dim. `values` retains a gradient but `indices` has none w.r.t self.
+    /// This expects a contiguous tensor.
+    fn topk(&self, topk: usize) -> Result<TopKOutput>;
+}
+
+impl TopKLastDimOp for Tensor {
+    fn topk(&self, topk: usize) -> Result<TopKOutput> {
+        // Sorted descending
+        let sorted_indices = self.arg_sort_last_dim(false)?;
+        let topk_indices = sorted_indices.narrow(D::Minus1, 0, topk)?.contiguous()?;
+        Ok(TopKOutput {
+            values: self.gather(&topk_indices, D::Minus1)?,
+            indices: topk_indices,
         })
     }
 }
 
 impl Module for Qwen3SparseMoeBlock {
+    //TO DO: Optimization #1 - move the routing logic to GPU
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let (b_size, seq_len, hidden_dim) = xs.dims3()?;
-        let xs = xs.reshape(((), hidden_dim))?;
-        let router_logits = xs.apply(&self.gate)?;
+        let xs_flat = xs.reshape(((), hidden_dim))?;
+        //let num_tokens = b_size * seq_len;
+        // Compute router logits and routing weights
+        let router_logits = xs_flat.apply(&self.gate)?;
         let routing_weights = candle_nn::ops::softmax_last_dim(&router_logits)?;
 
-        // Extract topk experts per token
-        let experts_per_tok = routing_weights
-            .arg_sort_last_dim(false)?
-            .narrow(D::Minus1, 0, self.num_experts_per_tok)?
-            .contiguous()?;
-        let routing_weights = routing_weights.gather(&experts_per_tok, D::Minus1)?;
-
-
-        if let Some(ref gemm) = self.grouped_gemm {
-            return self.forward_grouped_gemm(&xs, &routing_weights, &experts_per_tok, b_size, seq_len, hidden_dim, gemm);
+        // Get top-k experts per token using topk
+        let topk_output = routing_weights.topk(self.num_experts_per_tok)?;
+        let top_weights = topk_output.values;
+        let top_indices = topk_output.indices;
+        
+        // Normalize weights if needed
+        let top_weights = if self.norm_topk_prob {
+            let sum_weights = top_weights.sum_keepdim(D::Minus1)?;
+            top_weights.broadcast_div(&sum_weights)?
         } else {
-            panic!("Grouped GEMM not available on this device");
-        }
+            top_weights
+        };
 
-        // // Fallback to CPU routing with GPU operations
-        // self.forward_cpu(&xs, &routing_weights, &experts_per_tok, b_size, seq_len, hidden_dim)
-    }
-}
+        // Initialize output tensor
+        let mut ys = Tensor::zeros_like(&xs_flat)?;
 
-impl Qwen3SparseMoeBlock {
-    #[cfg(feature = "cuda")]
-    fn forward_grouped_gemm(
-        &self,
-        xs: &Tensor,
-        routing_weights: &Tensor,
-        experts_per_tok: &Tensor,
-        b_size: usize,
-        seq_len: usize,
-        hidden_dim: usize,
-        gemm: &Arc<MoeGroupedGemmPTX>,
-    ) -> Result<Tensor> {
-        let num_tokens = b_size * seq_len;
-        
-        // GPU-OPTIMIZED SPARSE ROUTING with minimal CPU transfer
-        // Key optimization: Single batched transfer of routing metadata only
-        
-        // Transfer routing metadata in one batch (GPU -> CPU)
-        // This is unavoidable for sparse indexing but kept minimal
-        let experts_per_tok_vec = experts_per_tok.to_vec2::<u32>()?;
-        
-        // Compute weights on GPU first, then transfer
-        let routing_weights_f32 = routing_weights.to_dtype(DType::F32)?;
-        let routing_weights_vec = routing_weights_f32.to_vec2::<f32>()?;
-
-        let mut expert_assignments = vec![vec![]; self.experts.len()];
-        let mut expert_weights = vec![vec![]; self.experts.len()];
-        
-        for (token_idx, (expert_ids, weights)) in experts_per_tok_vec.iter()
-            .zip(routing_weights_vec.iter()).enumerate() {
-            for (&expert_id, &weight) in expert_ids.iter().zip(weights.iter()) {
-                let expert_idx = expert_id as usize;
-                expert_assignments[expert_idx].push(token_idx as u32);
-                expert_weights[expert_idx].push(weight);
-            }
-        }
-        
-        // Prepare GPU tensors for grouped GEMM
-        let mut input_tensors = Vec::with_capacity(self.experts.len());
-        let mut gate_weights = Vec::with_capacity(self.experts.len());
-        let mut up_weights = Vec::with_capacity(self.experts.len());
-        let mut down_weights = Vec::with_capacity(self.experts.len());
-        
-        for (expert_idx, expert) in self.experts.iter().enumerate() {
-            let assigned_tokens = &expert_assignments[expert_idx];
+        // Process each expert
+        for expert_idx in 0..self.experts.len() {
+            // Create mask for tokens assigned to this expert: shape [num_tokens, num_experts_per_tok]
+            let expert_idx_tensor = Tensor::new(&[expert_idx as u32], xs.device())?
+                .to_dtype(top_indices.dtype())?;
+            let expert_mask = top_indices.eq(&expert_idx_tensor.broadcast_as(top_indices.shape())?)?;
             
-            if assigned_tokens.is_empty() {
-                // Empty expert - create zero tensor
-                input_tensors.push(Tensor::zeros((0, hidden_dim), xs.dtype(), xs.device())?);
-            } else {
-                // Gather assigned tokens on GPU (single efficient gather operation)
-                let indices = Tensor::new(assigned_tokens.as_slice(), xs.device())?;
-                let expert_input = xs.index_select(&indices, 0)?;
-                input_tensors.push(expert_input);
-            }
-            
-            gate_weights.push(expert.gate_weight().clone());
-            up_weights.push(expert.up_weight().clone());
-            down_weights.push(expert.down_weight().clone());
-        }
-        
-        // Execute grouped GEMM on GPU (all matrix ops stay on GPU)
-        let intermediate_size = self.experts[0].gate_weight().dims()[0];
-        let result = gemm.forward(
-            &input_tensors,
-            &gate_weights,
-            &up_weights,
-            &down_weights,
-            &expert_assignments,
-            &expert_weights,
-            num_tokens,
-            hidden_dim,
-            intermediate_size,
-        )?;
-        
-        result.reshape((b_size, seq_len, hidden_dim))
-    }
-    
-    fn forward_cpu(
-        &self,
-        xs: &Tensor,
-        routing_weights: &Tensor,
-        experts_per_tok: &Tensor,
-        b_size: usize,
-        seq_len: usize,
-        hidden_dim: usize,
-    ) -> Result<Tensor> {
-        // Extract needed data
-        let routing_weights = routing_weights.to_dtype(DType::F32)?.to_vec2::<f32>()?;
-        let experts_per_tok = experts_per_tok.to_vec2::<u32>()?;
-        let mut top_x = vec![vec![]; self.experts.len()];
-        let mut selected_experts = vec![vec![]; self.experts.len()];
-        
-        for (row_idx, (rw, expert_idxs)) in routing_weights
-            .iter()
-            .zip(experts_per_tok.iter())
-            .enumerate()
-        {
-            let sum_rw = rw.iter().sum::<f32>();
-            for (&rw, &expert_idx) in rw.iter().zip(expert_idxs.iter()) {
-                top_x[expert_idx as usize].push(row_idx as u32);
-                let rw = if self.norm_topk_prob { rw / sum_rw } else { rw };
-                selected_experts[expert_idx as usize].push(rw)
-            }
-        }
-
-        // Process through experts
-        let mut ys = xs.zeros_like()?;
-        for (expert_idx, expert_layer) in self.experts.iter().enumerate() {
-            let top_x = &top_x[expert_idx];
-            if top_x.is_empty() {
+            // Check if any tokens are assigned to this expert
+            // Sum across top-k dimension to get per-token assignment
+            let expert_mask_any = expert_mask.sum_keepdim(D::Minus1)?.squeeze(D::Minus1)?;
+            let any_assigned = expert_mask_any.sum_all()?.to_scalar::<u8>()? > 0;
+            if !any_assigned {
                 continue;
             }
-            let top_x = Tensor::new(top_x.as_slice(), xs.device())?;
-            let selected_experts =
-                Tensor::new(selected_experts[expert_idx].as_slice(), xs.device())?
-                    .reshape(((), 1))?
-                    .to_dtype(xs.dtype())?;
 
-            let current_state = xs.index_select(&top_x, 0)?.reshape(((), hidden_dim))?;
-            let current_hidden_states = expert_layer.forward(&current_state)?;
-            let current_hidden_states = current_hidden_states.broadcast_mul(&selected_experts)?;
-            ys = ys.index_add(&top_x, &current_hidden_states, 0)?;
+            // Create a mask expanded to match hidden_dim
+            // expert_mask_any: [num_tokens] -> [num_tokens, 1]
+            let token_mask = expert_mask_any.unsqueeze(D::Minus1)?.to_dtype(xs.dtype())?;
+            
+            // Select tokens by multiplying with mask
+            let masked_tokens = xs_flat.broadcast_mul(&token_mask)?;
+            
+            // Process all tokens through expert (including zeros for non-selected)
+            let expert_output = self.experts[expert_idx].forward(&masked_tokens)?;
+            
+            // Get the weights for this expert
+            // expert_mask: [num_tokens, num_experts_per_tok]
+            // top_weights: [num_tokens, num_experts_per_tok]
+            let expert_mask_f32 = expert_mask.to_dtype(DType::F32)?;
+            let top_weights_f32 = top_weights.to_dtype(DType::F32)?;
+            
+            // Element-wise multiply and sum across top-k dimension to get per-token weight
+            let expert_weights = (expert_mask_f32 * top_weights_f32)?
+                .sum_keepdim(D::Minus1)?
+                .to_dtype(xs.dtype())?;
+            
+            // Apply weights to expert output
+            let weighted_output = expert_output.broadcast_mul(&expert_weights)?;
+            
+            // Accumulate into output
+            ys = (ys + weighted_output)?;
         }
 
         ys.reshape((b_size, seq_len, hidden_dim))
     }
 }
-
-// impl Module for Qwen3SparseMoeBlock {
-//     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-//         let (b_size, seq_len, hidden_dim) = xs.dims3()?;
-//         let tokens = b_size * seq_len;
-//         let xs = xs.reshape((tokens, hidden_dim))?;
-
-//         // Router
-//         let router_logits = xs.apply(&self.gate)?;
-//         let routing_weights = candle_nn::ops::softmax_last_dim(&router_logits)?;
-
-//         // Top-k expert ids
-//         let experts_per_tok = routing_weights
-//             .arg_sort_last_dim(false)?                 // descending
-//             .narrow(D::Minus1, 0, self.num_experts_per_tok)?
-//             .contiguous()?
-//             .to_dtype(DType::U32)?;
-
-//         // Top-k weights
-//         let topk_weights = routing_weights.gather(&experts_per_tok, D::Minus1)?;
-
-//         // Optional normalization
-//         let topk_weights = if self.norm_topk_prob {
-//             let sum = topk_weights.sum_keepdim(D::Minus1)?;
-//             topk_weights.broadcast_div(&sum)?
-//         } else {
-//             topk_weights
-//         };
-
-//         let mut ys = xs.zeros_like()?;
-
-//         // Process each expert with zero-mask trick
-//         for expert_idx in 0..self.experts.len() {
-//             // Boolean mask: (tokens, k)
-//             let expert_mask = experts_per_tok.eq(expert_idx as u32)?
-//                 .to_dtype(xs.dtype())?;
-
-//             // Weighted mask (tokens, 1)
-//             let token_weights = expert_mask
-//                 .broadcast_mul(&topk_weights)?     // (tokens, k)
-//                 .sum(D::Minus1)?                   // (tokens)
-//                 .unsqueeze(1)?;                    // (tokens, 1)
-
-//             // Zero out tokens not assigned to this expert
-//             let gated_x = xs.broadcast_mul(&token_weights)?;  // (tokens, hidden_dim)
-
-//             // Run expert
-//             let y_exp = self.experts[expert_idx].forward(&gated_x)?;
-
-//             // Accumulate expert output
-//             ys = (ys + y_exp)?;   //  <-- FIXED LINE
-//         }
-
-//         ys.reshape((b_size, seq_len, hidden_dim))
-//     }
-// }
-
 
 // MLP or MoE decision enum
 #[derive(Debug, Clone)]

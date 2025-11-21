@@ -1,0 +1,55 @@
+Running benchmark with original model...
+Using device: Cuda(CudaDevice(DeviceId(1)))
+Creating test configuration (no real model weights)...
+Test config: experts=4, top_k=2, hidden_size=512
+Using ORIGINAL MoE backend
+Model loaded in 92.286024ms
+Warming up kernels...
+
+=== PREFILL 8192 tokens ===
+Prefill Throughput:  10882.9 tok/s
+Prefill Latency:     752.738459ms
+Latency / 1K tokens: 91.89 ms
+
+=== DECODE 512 tokens ===
+Decode Throughput: 465.9 tok/s
+Decode Latency:    1.098974239s
+Latency / Token:   2.146 ms/token
+
+=== BENCHMARK SUMMARY ===
+Model: Qwen/Qwen3-30B-A3B
+Backend: Original (slow)
+--- Prefill ---
+Throughput: 10882.9 tok/s
+Total time: 752.738459ms
+--- Decode ---
+Throughput: 465.9 tok/s
+Avg Latency: 2.146 ms/token
+
+Running benchmark with optimized model...
+Using device: Cuda(CudaDevice(DeviceId(1)))
+Creating test configuration (no real model weights)...
+Test config: experts=4, top_k=2, hidden_size=512
+Using OPTIMIZED MoE backend
+Model loaded in 85.115612ms
+Warming up kernels...
+
+=== PREFILL 8192 tokens ===
+Prefill Throughput:  12556.9 tok/s
+Prefill Latency:     652.392636ms
+Latency / 1K tokens: 79.64 ms
+
+=== DECODE 512 tokens ===
+Decode Throughput: 298.3 tok/s
+Decode Latency:    1.716410337s
+Latency / Token:   3.352 ms/token
+
+=== BENCHMARK SUMMARY ===
+Model: Qwen/Qwen3-30B-A3B
+Backend: Optimized (fast)
+--- Prefill ---
+Throughput: 12556.9 tok/s
+Total time: 652.392636ms
+--- Decode ---
+Throughput: 298.3 tok/s
+Avg Latency: 3.352 ms/token
